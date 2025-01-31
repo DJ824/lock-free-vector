@@ -1,0 +1,176 @@
+//
+// Created by Devang Jaiswal on 1/31/25.
+//
+
+#include <atomic>
+#include <memory>
+#include <cstdint>
+
+template <typename T>
+class LockFreeVector {
+private:
+    static constexpr uint32_t MAX_BUCKETS = 32;
+    static constexpr uint32_t FIRST_BUCKET_SIZE = 8;
+
+    // holds pending write operations, we use this to ensure a prev write op has completed before starting another one
+    struct WriteDescriptor {
+        T* loc_;
+        T old_val_;
+        T new_val_;
+        bool completed_;
+
+        WriteDescriptor() : loc_(nullptr), completed_(true) {}
+
+        WriteDescriptor(T* loc, const T& oldVal, const T& newVal)
+            : loc_(loc)
+            , old_val_(oldVal)
+            , new_val_(newVal)
+            , completed_(false) {}
+    };
+
+
+    // holds the current state of the vector
+    struct Descriptor {
+        size_t size_;
+        uint32_t counter_;
+        WriteDescriptor* pending_write_;
+
+        Descriptor(size_t s = 0, uint32_t c = 0, WriteDescriptor* w = nullptr)
+            : size_(s)
+            , counter_(c)
+            , pending_write_(w) {}
+    };
+
+    std::atomic<T*> memory_[MAX_BUCKETS];
+
+    std::atomic<Descriptor*> descriptor_;
+
+    std::pair<size_t, size_t> get_bucket_and_index(size_t position) const {
+        size_t bucket_size = FIRST_BUCKET_SIZE;
+        size_t bucket = 0;
+
+        while (position >= bucket_size && bucket < MAX_BUCKETS) {
+            position -= bucket_size;
+            bucket_size *= 2;
+            ++bucket;
+        }
+
+        return {bucket, position};
+    }
+
+public:
+    LockFreeVector() {
+        descriptor_.store(new Descriptor());
+
+        T* first_bucket = new T[FIRST_BUCKET_SIZE];
+        memory_[0].store(first_bucket);
+
+        for (size_t i = 1; i < MAX_BUCKETS; i++) {
+            memory_[i].store(nullptr);
+        }
+    }
+
+    T& at(size_t position) {
+        auto [bucket, index] = get_bucket_and_index(position);
+        return memory_[bucket].load()[index];
+    }
+
+    void push_back(const T& elem) {
+        while (true) {
+
+            Descriptor* current_desc = descriptor_.load();
+
+            if (current_desc->pending_write_) {
+                complete_write(current_desc->pending_write_);
+            }
+
+            size_t new_size = current_desc->size_ + 1;
+            auto [bucket, index] = get_bucket_and_index(current_desc->size_);
+
+            if (!memory_[bucket].load()) {
+                allocate_bucket(bucket);
+            }
+
+            T* target_loc = &(memory_[bucket].load()[index]);
+
+            // the current write operation we are doing
+            WriteDescriptor* write_operation = new WriteDescriptor(target_loc, T(), elem);
+            // new descriptor object with the current write op we are doing
+            Descriptor* new_desc = new Descriptor(new_size, current_desc->counter_ + 1, write_operation);
+
+            if (descriptor_.compare_exchange_strong(current_desc, new_desc)) {
+                complete_write(write_operation);
+                break;
+            }
+
+            delete write_operation;
+            delete new_desc;
+
+        }
+    }
+
+    T pop_back() {
+        while (true) {
+            Descriptor* current_desc = descriptor_.load();
+            if (current_desc->pending_write_) {
+                complete_write(current_desc->pending_write_);
+            }
+
+            auto [bucket, index] = get_bucket_and_index(current_desc->size_ - 1);
+            T* target_addr = &(memory_[bucket].load()[index]);
+
+            T value = *target_addr;
+
+            Descriptor* new_desc = new Descriptor(current_desc->size_ - 1, current_desc->counter_ + 1, nullptr);
+
+            if (descriptor_.compare_exchange_strong(current_desc, new_desc)) {
+                return value;
+            }
+
+            delete new_desc;
+        }
+    }
+
+    void complete_write(WriteDescriptor* write_op) {
+        if (write_op && !write_op->completed_) {
+            // get the location of the pending write op
+            std::atomic<T>* atomic_loc = reinterpret_cast<std::atomic<T>*>(write_op->location);
+            T expected = write_op->old_value;
+
+            if (atomic_loc->compare_exchange_strong(expected, write_op->new_value)) {
+                write_op->completed_ = true;
+            }
+
+            // if the cas fails, another thread already completed the write op
+            else {
+                write_op->completed_ = true;
+            }
+        }
+    }
+
+    void allocate_bucket(size_t bucket) {
+        size_t bucket_size = FIRST_BUCKET_SIZE * (1 << bucket);
+        T* new_bucket = new T[bucket_size];
+
+        // if we already have a bucket at the location we want to allocate, delete
+        if (!memory_[new_bucket].compare_exchange_strong(nullptr, new_bucket)) {
+            delete[] new_bucket;
+        }
+    }
+
+    T read(const size_t i) { return at(i); }
+
+    void write(const size_t i, const T& elem) {
+        auto [bucket, index] = get_bucket_and_index(i);
+
+        T* target = &(memory_[bucket].load()[index]);
+        std::atomic<T>* atomic_target = reinterpret_cast<std::atomic<T>*>(target);
+
+        atomic_target.store(elem, std::memory_order_release);
+    }
+
+
+
+    size_t size() const { return descriptor_.load()->size; }
+
+};
