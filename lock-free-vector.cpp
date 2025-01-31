@@ -45,19 +45,6 @@ private:
 
     std::atomic<Descriptor*> descriptor_;
 
-    std::pair<size_t, size_t> get_bucket_and_index(size_t position) const {
-        size_t bucket_size = FIRST_BUCKET_SIZE;
-        size_t bucket = 0;
-
-        while (position >= bucket_size && bucket < MAX_BUCKETS) {
-            position -= bucket_size;
-            bucket_size *= 2;
-            ++bucket;
-        }
-
-        return {bucket, position};
-    }
-
 public:
     LockFreeVector() {
         descriptor_.store(new Descriptor());
@@ -70,10 +57,27 @@ public:
         }
     }
 
+    // clz counts num of leading 0s starting from pos 31, substract 31 - num to get msb
     T& at(size_t position) {
-        auto [bucket, index] = get_bucket_and_index(position);
+        size_t pos = position + FIRST_BUCKET_SIZE;
+        size_t hi_bit = __builtin_clz(pos) ^ 31;
+        size_t bucket = hi_bit - (__builtin_clz(FIRST_BUCKET_SIZE) ^ 31);
+        size_t index = pos ^ (1UL << hi_bit);
         return memory_[bucket].load()[index];
     }
+
+    void allocate_bucket(size_t bucket) {
+        size_t bucket_size = FIRST_BUCKET_SIZE * (1 << bucket);
+        T* new_bucket = new T[bucket_size];
+
+        T* expected = nullptr;
+
+        // if we already have a bucket at the location we want to allocate, delete
+        if (!memory_[bucket].compare_exchange_strong(expected, new_bucket)) {
+            delete[] new_bucket;
+        }
+    }
+
 
     void push_back(const T& elem) {
         while (true) {
@@ -85,8 +89,13 @@ public:
             }
 
             size_t new_size = current_desc->size_ + 1;
-            auto [bucket, index] = get_bucket_and_index(current_desc->size_);
 
+            size_t pos = current_desc->size_ + FIRST_BUCKET_SIZE;
+            size_t hi_bit = __builtin_clz(pos) ^ 31;
+            size_t bucket = hi_bit - (__builtin_clz(FIRST_BUCKET_SIZE) ^ 31);
+            size_t index = pos ^ (1UL << hi_bit);
+
+            // allocate a new bucket if needed
             if (!memory_[bucket].load()) {
                 allocate_bucket(bucket);
             }
@@ -116,7 +125,11 @@ public:
                 complete_write(current_desc->pending_write_);
             }
 
-            auto [bucket, index] = get_bucket_and_index(current_desc->size_ - 1);
+            size_t pos = (current_desc->size_  - 1) + FIRST_BUCKET_SIZE;
+            size_t hi_bit = __builtin_clz(pos) ^ 31;
+            size_t bucket = hi_bit - (__builtin_clz(FIRST_BUCKET_SIZE) ^ 31);
+            size_t index = pos ^ (1UL << hi_bit);
+
             T* target_addr = &(memory_[bucket].load()[index]);
 
             T value = *target_addr;
@@ -134,10 +147,10 @@ public:
     void complete_write(WriteDescriptor* write_op) {
         if (write_op && !write_op->completed_) {
             // get the location of the pending write op
-            std::atomic<T>* atomic_loc = reinterpret_cast<std::atomic<T>*>(write_op->location);
-            T expected = write_op->old_value;
+            std::atomic<T>* atomic_loc = reinterpret_cast<std::atomic<T>*>(write_op->loc_);
+            T expected = write_op->old_val_;
 
-            if (atomic_loc->compare_exchange_strong(expected, write_op->new_value)) {
+            if (atomic_loc->compare_exchange_strong(expected, write_op->new_val_)) {
                 write_op->completed_ = true;
             }
 
@@ -148,29 +161,23 @@ public:
         }
     }
 
-    void allocate_bucket(size_t bucket) {
-        size_t bucket_size = FIRST_BUCKET_SIZE * (1 << bucket);
-        T* new_bucket = new T[bucket_size];
 
-        // if we already have a bucket at the location we want to allocate, delete
-        if (!memory_[new_bucket].compare_exchange_strong(nullptr, new_bucket)) {
-            delete[] new_bucket;
-        }
-    }
 
     T read(const size_t i) { return at(i); }
 
     void write(const size_t i, const T& elem) {
-        auto [bucket, index] = get_bucket_and_index(i);
+        size_t pos = i + FIRST_BUCKET_SIZE;
+        size_t hi_bit = __builtin_clz(pos) ^ 31;
+        size_t bucket = hi_bit - (__builtin_clz(FIRST_BUCKET_SIZE) ^ 31);
+        size_t index = pos ^ (1UL << hi_bit);
 
         T* target = &(memory_[bucket].load()[index]);
         std::atomic<T>* atomic_target = reinterpret_cast<std::atomic<T>*>(target);
 
-        atomic_target.store(elem, std::memory_order_release);
+        atomic_target->store(elem, std::memory_order_release);
     }
 
 
-
-    size_t size() const { return descriptor_.load()->size; }
+    size_t size() const { return descriptor_.load()->size_; }
 
 };
