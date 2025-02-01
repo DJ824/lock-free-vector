@@ -120,9 +120,14 @@ public:
 
     T pop_back() {
         while (true) {
+
             Descriptor* current_desc = descriptor_.load();
             if (current_desc->pending_write_) {
                 complete_write(current_desc->pending_write_);
+            }
+
+            if (current_desc->size_ == 0) {
+                throw std::out_of_range("empty");
             }
 
             size_t pos = (current_desc->size_  - 1) + FIRST_BUCKET_SIZE;
@@ -134,11 +139,18 @@ public:
 
             T value = *target_addr;
 
-            Descriptor* new_desc = new Descriptor(current_desc->size_ - 1, current_desc->counter_ + 1, nullptr);
+            WriteDescriptor* write_op = new WriteDescriptor(target_addr,
+                                                      value,
+                                                      T());
+
+            Descriptor* new_desc = new Descriptor(current_desc->size_ - 1, current_desc->counter_ + 1, write_op);
 
             if (descriptor_.compare_exchange_strong(current_desc, new_desc)) {
+                complete_write(write_op);
                 return value;
             }
+
+            delete write_op;
 
             delete new_desc;
         }
