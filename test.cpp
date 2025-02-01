@@ -55,7 +55,7 @@ TEST_F(LockFreeVectorTest, PopBackSequential) {
 
 TEST_F(LockFreeVectorTest, ConcurrentMixedOperations) {
     const int num_threads = 4;
-    const int ops_per_thread = 1000;
+    const int ops_per_thread = 10000;
     std::atomic<int> total_pushes(0);
     std::atomic<int> total_pops(0);
     std::vector<std::thread> threads;
